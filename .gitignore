@@ -34,3 +34,10 @@ build/
 # ======================
 .vscode/
 .idea/
+
+# Local Claude brain
+.claude/
+CLAUDE.md
+
+# Docs (exclude all for now)
+docs/
