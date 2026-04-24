@@ -1,0 +1,36 @@
+# ======================
+# GLOBAL
+# ======================
+.DS_Store
+Thumbs.db
+
+# ======================
+# BACKEND (Python)
+# ======================
+backend/.venv/
+backend/__pycache__/
+backend/*.pyc
+backend/.pytest_cache/
+backend/.mypy_cache/
+backend/.env
+
+# ======================
+# FRONTEND (Next.js)
+# ======================
+frontend/node_modules/
+frontend/.next/
+frontend/.env.local
+frontend/.env
+
+# ======================
+# BUILD / TEMP
+# ======================
+dist/
+build/
+*.log
+
+# ======================
+# IDE
+# ======================
+.vscode/
+.idea/
