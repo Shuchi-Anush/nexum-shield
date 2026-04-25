@@ -29,7 +29,25 @@ def decide(
     band: ConfidenceBand,
     model_version: str,
 ) -> dict[str, Any]:
-    action = _BAND_TO_ACTION[band] if matched_asset is not None else "ALLOW"
+    if matched_asset is None:
+        action = "ALLOW"
+    else:
+        trust = matched_asset.get("trust_level")
+        if trust == "verified":
+            if similarity >= 0.8:
+                action = "BLOCK"
+            elif similarity >= 0.4:
+                action = "FLAG"
+            else:
+                # Verified rights-holder match: stay suspicious below 0.4.
+                action = "FLAG"
+        else:
+            if similarity >= 0.85:
+                action = "BLOCK"
+            elif similarity >= 0.5:
+                action = "FLAG"
+            else:
+                action = "ALLOW"
 
     reason = {
         "input_media_id": input_media_id,
@@ -44,19 +62,23 @@ def decide(
         "band": band.value,
         "model_version": model_version,
         "timestamp": time.time(),
-        "explanation": _explain(action, band, matched_asset),
+        "explanation": _explain(action, matched_asset, similarity),
     }
     return {"action": action, "reason": reason}
 
 
 def _explain(
-    action: str, band: ConfidenceBand, matched_asset: Optional[dict]
+    action: str, matched_asset: Optional[dict], similarity: float
 ) -> str:
     if matched_asset is None:
-        return "No matching protected asset; content allowed."
+        return (
+            f"No matching protected asset; similarity={similarity:.3f}; "
+            f"policy=trust-aware-threshold → {action}."
+        )
     return (
         f"Match against {matched_asset.get('asset_id')} "
         f"(owner={matched_asset.get('owner')}, "
         f"trust={matched_asset.get('trust_level')}); "
-        f"confidence={band.value} -> {action}."
+        f"similarity={similarity:.3f}; "
+        f"policy=trust-aware-threshold → {action}."
     )

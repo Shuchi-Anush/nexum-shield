@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+from app.core.event_store import stage_event
 from app.core.job_store import JobStatus, job_store
 from app.engines import (
     embedding_engine,
@@ -31,49 +32,54 @@ def run_pipeline(job_id: str) -> None:
 
         payload: Any = job.metadata or {}
 
-        fingerprint = fingerprint_engine.compute_fingerprint(payload)
-        job_store.update_stage(job_id, "fingerprint", {"hash": fingerprint})
+        with stage_event(job_id, "fingerprint"):
+            fingerprint = fingerprint_engine.compute_fingerprint(payload)
+            job_store.update_stage(job_id, "fingerprint", {"hash": fingerprint})
 
-        vector = embedding_engine.embed(fingerprint)
-        job_store.update_stage(
-            job_id,
-            "embedding",
-            {
-                "vector": vector,
-                "model_version": embedding_engine.MODEL_VERSION,
-            },
-        )
+        with stage_event(job_id, "embedding"):
+            vector = embedding_engine.embed(fingerprint)
+            job_store.update_stage(
+                job_id,
+                "embedding",
+                {
+                    "vector": vector,
+                    "model_version": embedding_engine.MODEL_VERSION,
+                },
+            )
 
-        match = matching_engine.find_best_match(vector)
-        matched_asset_dict: Optional[dict] = (
-            {
-                "asset_id": match.matched_asset.asset_id,
-                "owner": match.matched_asset.owner,
-                "trust_level": match.matched_asset.trust_level,
-            }
-            if match.matched_asset is not None
-            else None
-        )
-        job_store.update_stage(
-            job_id,
-            "matching",
-            {
-                "matched_asset": matched_asset_dict,
-                "similarity": match.similarity,
-            },
-        )
+        with stage_event(job_id, "matching"):
+            match = matching_engine.find_best_match(vector)
+            matched_asset_dict: Optional[dict] = (
+                {
+                    "asset_id": match.matched_asset.asset_id,
+                    "owner": match.matched_asset.owner,
+                    "trust_level": match.matched_asset.trust_level,
+                }
+                if match.matched_asset is not None
+                else None
+            )
+            job_store.update_stage(
+                job_id,
+                "matching",
+                {
+                    "matched_asset": matched_asset_dict,
+                    "similarity": match.similarity,
+                },
+            )
 
-        band = scoring_engine.score(match.similarity)
-        job_store.update_stage(job_id, "scoring", {"band": band.value})
+        with stage_event(job_id, "scoring"):
+            band = scoring_engine.score(match.similarity)
+            job_store.update_stage(job_id, "scoring", {"band": band.value})
 
-        decision = enforcement_engine.decide(
-            input_media_id=fingerprint,
-            matched_asset=matched_asset_dict,
-            similarity=match.similarity,
-            band=band,
-            model_version=embedding_engine.MODEL_VERSION,
-        )
-        job_store.update_stage(job_id, "enforcement", decision)
+        with stage_event(job_id, "enforcement"):
+            decision = enforcement_engine.decide(
+                input_media_id=fingerprint,
+                matched_asset=matched_asset_dict,
+                similarity=match.similarity,
+                band=band,
+                model_version=embedding_engine.MODEL_VERSION,
+            )
+            job_store.update_stage(job_id, "enforcement", decision)
 
         result = {
             "match": match.matched_asset is not None,
