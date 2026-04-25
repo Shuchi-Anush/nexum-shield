@@ -3,6 +3,17 @@
 # ======================
 .DS_Store
 Thumbs.db
+*.log
+
+# ======================
+# ENV
+# ======================
+.env
+.env.*
+!.env.example
+
+backend/.env
+frontend/.env.local
 
 # ======================
 # BACKEND (Python)
@@ -12,22 +23,20 @@ backend/__pycache__/
 backend/*.pyc
 backend/.pytest_cache/
 backend/.mypy_cache/
-backend/.env
 
 # ======================
 # FRONTEND (Next.js)
 # ======================
 frontend/node_modules/
 frontend/.next/
-frontend/.env.local
-frontend/.env
+frontend/out/
+frontend/build/
 
 # ======================
 # BUILD / TEMP
 # ======================
 dist/
 build/
-*.log
 
 # ======================
 # IDE
@@ -35,9 +44,13 @@ build/
 .vscode/
 .idea/
 
-# Local Claude brain
+# ======================
+# LOCAL DEV / PRIVATE
+# ======================
 .claude/
 CLAUDE.md
 
-# Docs (exclude all for now)
+# ======================
+# DOCS (optional)
+# ======================
 docs/

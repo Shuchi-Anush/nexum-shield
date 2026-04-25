@@ -2,7 +2,6 @@ from fastapi import FastAPI
 from app.api import health, ingest, jobs
 from app.core.config import get_settings
 
-
 def create_app() -> FastAPI:
     settings = get_settings()
 
@@ -18,6 +17,5 @@ def create_app() -> FastAPI:
     app.include_router(jobs.router)
 
     return app
-
 
 app = create_app()
