@@ -12,6 +12,13 @@ delete the lock of a successor that acquired the key after the original
 TTL expired. Any exception during pipeline execution flips the job to
 FAILED before the lock is released, so jobs are never stranded in
 PROCESSING by a clean exception path.
+
+At each stage transition the worker publishes a canonical pipeline event
+(`.claude/rules/eventing.md`) via `publish_event`, alongside the lifecycle
+audit emitted by the `stage_event` context manager. Domain events carry
+strict typed payloads; lifecycle events carry latency. Both share the same
+per-job audit log, so downstream readers reconstruct the timeline with a
+single sorted-set scan.
 """
 
 from __future__ import annotations
@@ -19,7 +26,19 @@ from __future__ import annotations
 import uuid
 from typing import Any, Optional
 
-from app.core.event_store import stage_event
+from app.core.event_store import (
+    EmbeddingReadyPayload,
+    EnforcedPayload,
+    FingerprintReadyPayload,
+    JobCompletedPayload,
+    JobFailedPayload,
+    MatchFoundPayload,
+    MatchNotFoundPayload,
+    PipelineEventType,
+    ScoredPayload,
+    publish_event,
+    stage_event,
+)
 from app.core.job_store import JobStatus, job_store
 from app.core.queue import redis_conn
 from app.engines import (
@@ -88,12 +107,31 @@ def run_pipeline(job_id: str) -> None:
 
             payload: Any = job.metadata or {}
 
+            # ------------------------------------------------------------
+            # Fingerprint
+            # ------------------------------------------------------------
             with stage_event(job_id, "fingerprint"):
                 fingerprint = fingerprint_engine.compute_fingerprint(payload)
-                job_store.update_stage(job_id, "fingerprint", {"hash": fingerprint})
+                content_hash = fingerprint.content_hash
+                job_store.update_stage(
+                    job_id, "fingerprint", {"hash": content_hash}
+                )
 
+            publish_event(
+                job_id,
+                PipelineEventType.FINGERPRINT_READY,
+                FingerprintReadyPayload(
+                    content_hash=content_hash,
+                    model_version=fingerprint.model_version,
+                    source_mode=fingerprint.source_mode,
+                ),
+            )
+
+            # ------------------------------------------------------------
+            # Embedding
+            # ------------------------------------------------------------
             with stage_event(job_id, "embedding"):
-                vector = embedding_engine.embed(fingerprint)
+                vector = embedding_engine.embed(content_hash)
                 job_store.update_stage(
                     job_id,
                     "embedding",
@@ -103,6 +141,18 @@ def run_pipeline(job_id: str) -> None:
                     },
                 )
 
+            publish_event(
+                job_id,
+                PipelineEventType.EMBEDDING_READY,
+                EmbeddingReadyPayload(
+                    dimension=len(vector),
+                    model_version=embedding_engine.MODEL_VERSION,
+                ),
+            )
+
+            # ------------------------------------------------------------
+            # Matching
+            # ------------------------------------------------------------
             with stage_event(job_id, "matching"):
                 match = matching_engine.find_best_match(vector)
                 matched_asset_dict: Optional[dict] = (
@@ -123,13 +173,43 @@ def run_pipeline(job_id: str) -> None:
                     },
                 )
 
+            if match.matched_asset is not None:
+                publish_event(
+                    job_id,
+                    PipelineEventType.MATCH_FOUND,
+                    MatchFoundPayload(
+                        matched_asset_id=match.matched_asset.asset_id,
+                        similarity=match.similarity,
+                        owner=match.matched_asset.owner,
+                        trust_level=match.matched_asset.trust_level,
+                    ),
+                )
+            else:
+                publish_event(
+                    job_id,
+                    PipelineEventType.MATCH_NOT_FOUND,
+                    MatchNotFoundPayload(similarity=match.similarity),
+                )
+
+            # ------------------------------------------------------------
+            # Scoring
+            # ------------------------------------------------------------
             with stage_event(job_id, "scoring"):
                 band = scoring_engine.score(match.similarity)
                 job_store.update_stage(job_id, "scoring", {"band": band.value})
 
+            publish_event(
+                job_id,
+                PipelineEventType.SCORED,
+                ScoredPayload(band=band.value, similarity=match.similarity),
+            )
+
+            # ------------------------------------------------------------
+            # Enforcement
+            # ------------------------------------------------------------
             with stage_event(job_id, "enforcement"):
                 decision = enforcement_engine.decide(
-                    input_media_id=fingerprint,
+                    input_media_id=content_hash,
                     matched_asset=matched_asset_dict,
                     similarity=match.similarity,
                     band=band,
@@ -137,6 +217,25 @@ def run_pipeline(job_id: str) -> None:
                 )
                 job_store.update_stage(job_id, "enforcement", decision)
 
+            publish_event(
+                job_id,
+                PipelineEventType.ENFORCED,
+                EnforcedPayload(
+                    action=decision["action"],
+                    similarity=match.similarity,
+                    band=band.value,
+                    model_version=embedding_engine.MODEL_VERSION,
+                    matched_media_id=(
+                        matched_asset_dict["asset_id"]
+                        if matched_asset_dict
+                        else None
+                    ),
+                ),
+            )
+
+            # ------------------------------------------------------------
+            # Terminal transition
+            # ------------------------------------------------------------
             result = {
                 "match": match.matched_asset is not None,
                 "owner": match.matched_asset.owner if match.matched_asset else None,
@@ -153,12 +252,36 @@ def run_pipeline(job_id: str) -> None:
             )
             job_store.update_status(job_id, terminal)
 
+            publish_event(
+                job_id,
+                PipelineEventType.JOB_COMPLETED,
+                JobCompletedPayload(
+                    terminal_status=terminal.value,
+                    action=decision["action"],
+                ),
+            )
+
         except Exception as exc:
             # Pipeline body failed — never strand the job in PROCESSING.
+            # Order: try to flip state first, then publish JOB_FAILED only
+            # if we owned the transition, so we never double-publish a
+            # terminal event for a job another writer already failed.
+            failed = False
             try:
                 job_store.set_failure(job_id, f"{type(exc).__name__}: {exc}")
+                failed = True
             except ValueError:
                 # Already in a terminal state; nothing to record.
                 pass
+
+            if failed:
+                publish_event(
+                    job_id,
+                    PipelineEventType.JOB_FAILED,
+                    JobFailedPayload(
+                        error_type=type(exc).__name__,
+                        error_message=str(exc),
+                    ),
+                )
     finally:
         _release_lock(job_id, token)

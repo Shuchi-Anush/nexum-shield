@@ -59,6 +59,45 @@ class Settings(BaseSettings):
     GRAPH_DEFAULT_DEPTH: int = 3
 
     # ======================
+    # LLM PROVIDER
+    # ======================
+    LLM_PROVIDER: str = "gemini"                 # "gemini" | future: "claude" | "openai"
+
+    GEMINI_API_KEY: str = ""
+    GEMINI_MODEL: str = "gemini-2.5-flash"
+    GEMINI_TIMEOUT_SECONDS: float = 30.0
+    GEMINI_MAX_RETRIES: int = 3
+    GEMINI_MAX_CONCURRENCY: int = 8              # asyncio.Semaphore bound
+    GEMINI_MAX_REQUEST_BYTES: int = 1_048_576    # 1 MiB serialized payload guard
+
+    # ======================
+    # LLM ORCHESTRATION
+    # ======================
+    LLM_ORCH_BUDGET_KEY: str = "default"
+    LLM_ORCH_BUDGET_LIMIT_USD: float = 100.0
+    LLM_ORCH_RESERVATION_TTL_SECONDS: int = 300
+    LLM_ORCH_REAPER_INTERVAL_SECONDS: float = 30.0
+    LLM_ORCH_COST_SAFETY_MARGIN: float = 1.10    # multiplier on estimates
+
+    LLM_ORCH_RATE_HIGH_CAPACITY: int = 60
+    LLM_ORCH_RATE_HIGH_REFILL_PER_SEC: float = 1.0
+    LLM_ORCH_RATE_NORMAL_CAPACITY: int = 30
+    LLM_ORCH_RATE_NORMAL_REFILL_PER_SEC: float = 0.5
+    LLM_ORCH_RATE_LOW_CAPACITY: int = 10
+    LLM_ORCH_RATE_LOW_REFILL_PER_SEC: float = 0.2
+
+    LLM_ORCH_HEALTH_WINDOW_SIZE: int = 100
+    LLM_ORCH_HEALTH_WINDOW_SECONDS: float = 300.0
+    LLM_ORCH_HEALTH_MIN_OBSERVATIONS: int = 5
+
+    LLM_ORCH_CACHE_NAMESPACE: str = "llm:cache"
+    LLM_ORCH_CACHE_DEFAULT_TTL_SECONDS: int = 3600
+
+    LLM_ORCH_DEFAULT_DEADLINE_SECONDS: float = 30.0
+    LLM_ORCH_DEFAULT_MAX_ATTEMPTS: int = 5
+    LLM_ORCH_SCHEMA_CORRECTION_ENABLED: bool = True
+
+    # ======================
     # FUTURE (DO NOT USE YET)
     # ======================
     DATABASE_URL: Optional[str] = None
