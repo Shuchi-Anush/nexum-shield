@@ -54,3 +54,26 @@ CLAUDE.md
 # DOCS (optional)
 # ======================
 docs/
+
+# ======================
+# SECRETS (CRITICAL)
+# ======================
+# Generic secrets
+*.pem
+*.key
+*.crt
+*.p12
+
+# Service accounts / credentials
+*service-account*.json
+*credentials*.json
+*secret*.json
+
+# Explicit block (extra safety)
+backend/gcp-service-account.json
+
+# Allow safe JSON configs explicitly
+!package.json
+!tsconfig.json
+!pyproject.toml
+!uv.lock
