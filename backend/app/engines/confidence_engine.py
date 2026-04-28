@@ -145,7 +145,9 @@ def _completeness(
     s2 = not bool(input.trust_owner.is_default)
     s3 = not bool(input.trust_uploader.is_default)
     s4 = int(input.observation_count) >= int(config.s4_observation_threshold)
-    s5 = str(input.signal_source) == str(config.fusion_signal_source)
+    s5 = _norm_source(input.signal_source) == _norm_source(
+        config.fusion_signal_source
+    )
     signals_present = sum(1 for s in (s1, s2, s3, s4, s5) if s)
     return _clamp01(signals_present / 5.0)
 
@@ -194,7 +196,9 @@ def _uncertainty(
     if u4 > 0.0:
         reasons.append(ConfidenceReasonCode.LOW_OBSERVATIONS)
 
-    not_fusion = str(input.signal_source) != str(config.fusion_signal_source)
+    not_fusion = _norm_source(input.signal_source) != _norm_source(
+        config.fusion_signal_source
+    )
     u5 = config.u5_value if not_fusion else 0.0
     if u5 > 0.0:
         reasons.append(ConfidenceReasonCode.SINGLE_ENGINE_MATCH)
@@ -249,3 +253,9 @@ def _clamp01(x: float) -> float:
     if x > 1.0:
         return 1.0
     return x
+
+
+def _norm_source(x: object) -> str:
+    if x is None:
+        return ""
+    return str(x).strip().lower()
