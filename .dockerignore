@@ -1,0 +1,53 @@
+# Python
+
+**pycache**/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+
+.venv/
+venv/
+
+# Node
+
+node_modules/
+.next/
+
+# Build artifacts
+
+dist/
+build/
+
+# Uploads / runtime
+
+uploads/
+tmp/
+artifacts/
+
+# Git
+
+.git/
+.gitignore
+
+# Claude transient cognition
+
+.claude/memory/
+.claude/claude_sessions/
+.claude/labs/
+
+# Environment files
+
+.env
+.env.*
+
+# IDE
+
+.vscode/
+.idea/
+
+# OS
+
+.DS_Store
+Thumbs.db

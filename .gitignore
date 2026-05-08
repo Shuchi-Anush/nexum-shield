@@ -11,6 +11,8 @@ Thumbs.db
 .env
 .env.*
 !.env.example
+!backend/.env.example
+!frontend/.env.example
 
 backend/.env
 frontend/.env.local
@@ -45,15 +47,31 @@ build/
 .idea/
 
 # ======================
-# LOCAL DEV / PRIVATE
+# LOCAL DEV / PRIVATE — selective tracking per governance migration
 # ======================
-.claude/
-CLAUDE.md
+# Phase-1 persistence model: most of .claude/ is tracked (rules, agents,
+# skills, archive, CLAUDE.md, settings.json). Only working-cognition,
+# transcripts, active labs, and personal-settings paths stay ignored.
+#
+# We do NOT blanket-ignore .claude/ — git short-circuits descending into
+# excluded directories, which would defeat per-subpath negations.
 
-# ======================
-# DOCS (optional)
-# ======================
-docs/
+.claude/memory/
+.claude/claude_sessions/
+.claude/labs/
+.claude/settings.local.json
+.claude/settings.json
+
+# Everything else under .claude/ is tracked, including:
+#   .claude/CLAUDE.md, .claude/rules/**, .claude/agents/**,
+#   .claude/skills/**, .claude/archive/**
+#
+# .claude/settings.json — currently treated as local/transient until
+# governance stabilises further; revisit in a later phase.
+
+# Note: CLAUDE.md (root) and docs/** are NOT ignored — they have no
+# matching rule above and are therefore tracked by default. The earlier
+# blanket "docs/" and "CLAUDE.md" ignores have been removed.
 
 # ======================
 # SECRETS (CRITICAL)
@@ -67,7 +85,7 @@ docs/
 # Service accounts / credentials
 *service-account*.json
 *credentials*.json
-*secret*.json
+secrets/
 
 # Explicit block (extra safety)
 backend/gcp-service-account.json
