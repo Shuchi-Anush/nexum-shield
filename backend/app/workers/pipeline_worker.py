@@ -51,9 +51,12 @@ single sorted-set scan.
 
 from __future__ import annotations
 
+import logging
 import time
 import uuid
 from typing import Any, Dict, List, Optional
+
+_logger = logging.getLogger(__name__)
 
 from app.core.event_store import (
     ConfidenceComputedPayload,
@@ -71,6 +74,7 @@ from app.core.event_store import (
     publish_event,
     stage_event,
 )
+from app.core.evidence_store import record_evidence
 from app.core.job_store import JobStatus, job_store
 from app.core.queue import redis_conn
 from app.engines import (
@@ -360,6 +364,10 @@ def _build_policy_context(
         has_multiple_matches=False,
         matched_asset_owner=matched_asset_owner,
         distinct_matched_owner_count=1,
+        # H-2 lineage: bind the upstream embedding model version into
+        # the evaluation_hash so a model upgrade is reflected in the
+        # audit hash even when (band, tier, signals) are unchanged.
+        embedding_model_version=embedding_engine.MODEL_VERSION,
     )
 
 
@@ -437,9 +445,22 @@ def run_pipeline(job_id: str) -> None:
                 payload if isinstance(payload, dict) else {}
             )
             content_type: str = metadata_dict.get("content_type") or "video"
-            uploader_trust_level: Optional[str] = (
-                metadata_dict.get("uploader_trust_level")
-            )
+            # H-3: uploader trust MUST come from an authenticated identity
+            # source, not from caller-controlled metadata. Until auth lands,
+            # we hardcode to None so the ConfidenceEngine treats trust as
+            # registry-default and the DecisionEngine uses the trust floor.
+            # Any caller-supplied value is ignored and logged as a probable
+            # privilege-escalation attempt.
+            if metadata_dict.get("uploader_trust_level") is not None or (
+                isinstance(metadata_dict.get("metadata"), dict)
+                and metadata_dict["metadata"].get("uploader_trust_level")
+                is not None
+            ):
+                _logger.warning(
+                    "ignored caller-supplied uploader_trust_level",
+                    extra={"job_id": job_id},
+                )
+            uploader_trust_level: Optional[str] = None
 
             # ------------------------------------------------------------
             # Fingerprint
@@ -679,18 +700,28 @@ def run_pipeline(job_id: str) -> None:
                     "policy_action": final_action.value,
                     "policy_legacy_action": legacy_action,
                     "primary_reason": policy_result.primary_reason,
-                    "triggered_rules": list(policy_result.triggered_rules),
+                    "triggered_rules": sorted(policy_result.triggered_rules),
                     "evaluation_hash": policy_result.evaluation_hash,
                     "policy_version": policy_result.policy_version,
                     "decision_config_version": policy_result.decision_config_version,
                     "confidence_config_version": policy_result.confidence_config_version,
+                    "embedding_model_version": embedding_engine.MODEL_VERSION,
                 }
+
+                # H-4: durable, append-only evidence record. The JobStore
+                # `enforcement` stage carries the same dict for the API
+                # response, but its TTL means it cannot be the long-term
+                # source of truth (storage rules §6).
+                evidence_record = record_evidence(job_id, evidence)
+                evidence_key = evidence_record.key
+
                 job_store.update_stage(
                     job_id,
                     "enforcement",
                     {
                         "action": legacy_action,
                         "policy_action": final_action.value,
+                        "evidence_key": evidence_key,
                         "reason": evidence,
                     },
                 )
@@ -727,6 +758,7 @@ def run_pipeline(job_id: str) -> None:
                 "policy_action": final_action.value,      # canonical 5-action
                 "primary_reason": policy_result.primary_reason,
                 "evaluation_hash": policy_result.evaluation_hash,
+                "evidence_key": evidence_key,             # H-4 durable pointer
                 "reason": evidence,
             }
             job_store.set_result(job_id, result)

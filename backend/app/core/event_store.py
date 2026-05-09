@@ -274,6 +274,20 @@ def _coerce_type(event_type: EventTypeLike) -> str:
     return event_type
 
 
+# H-5: bound audit-log growth. Default 30 days; can be overridden via
+# settings.AUDIT_TTL_SECONDS (None or non-positive = no expiry, retained
+# for callers that want the legacy unbounded log).
+_DEFAULT_AUDIT_TTL_SECONDS = 30 * 24 * 3600
+
+
+def _audit_ttl_seconds() -> Optional[int]:
+    from app.core.config import get_settings  # late import — avoids cycle
+    ttl = getattr(get_settings(), "AUDIT_TTL_SECONDS", _DEFAULT_AUDIT_TTL_SECONDS)
+    if ttl is None or ttl <= 0:
+        return None
+    return int(ttl)
+
+
 def emit(
     job_id: str,
     stage: str,
@@ -286,6 +300,11 @@ def emit(
     Accepts either a lifecycle `EventType`, a canonical `PipelineEventType`,
     or a raw string. Payload is the already-serialisable dict — typed
     callers go through `publish_event` so their payload is validated first.
+
+    H-6: the SET + ZADD pair is wrapped in a Redis pipeline so a crash
+    between the two writes does not leave an event blob un-indexed
+    (i.e. invisible to ``consume_events``). H-5: both keys carry the
+    audit TTL so the per-job log eventually expires.
     """
     ts_ns = time.time_ns()
     event = Event(
@@ -298,8 +317,17 @@ def emit(
         latency_ms=latency_ms,
     )
     key = _event_key(job_id, ts_ns)
-    redis_conn.set(key, json.dumps(asdict(event)))
-    redis_conn.zadd(_index_key(job_id), {key: ts_ns})
+    idx = _index_key(job_id)
+    blob = json.dumps(asdict(event), sort_keys=True)  # sorted: deterministic
+
+    ttl = _audit_ttl_seconds()
+    pipe = redis_conn.pipeline(transaction=False)
+    pipe.set(key, blob)
+    pipe.zadd(idx, {key: ts_ns})
+    if ttl is not None:
+        pipe.expire(key, ttl)
+        pipe.expire(idx, ttl)
+    pipe.execute()
 
 
 def list_events(job_id: str) -> List[dict]:

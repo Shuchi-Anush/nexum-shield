@@ -91,7 +91,7 @@ from __future__ import annotations
 import hashlib
 import logging
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Iterable, Optional
 
 from app.models.confidence_models import (
     ConfidenceBreakdown,
@@ -352,12 +352,34 @@ def _compute_evaluation_hash(
     is_first_offense: bool,
     has_prior_disputes: bool,
     distinct_matched_owner_count: int,
+    decision_config_version: str,
+    confidence_config_version: str,
+    embedding_model_version: Optional[str],
 ) -> str:
-    """SHA-256 over 12 deterministically-serialized inputs (v5 §2).
+    """SHA-256 over 15 deterministically-serialized inputs.
 
-    Floats rounded to 4 decimal places to remove platform float drift.
-    Triggered rules sorted alphabetically. Output is the first 16 hex
-    characters of the digest.
+    Hash inputs (v5 §2 + H-1/H-2 extension):
+
+      1. triggered_rules (sorted)
+      2. final_action
+      3. policy_version
+      4. rules_checked_count
+      5. risk_band
+      6. confidence_tier
+      7. confidence_composite (4-decimal-place format)
+      8. signal_source (post-normalization)
+      9. similarity (4-decimal-place format)
+      10. is_first_offense
+      11. has_prior_disputes
+      12. distinct_matched_owner_count
+      13. decision_config_version          (H-1: lineage in hash)
+      14. confidence_config_version        (H-1: lineage in hash)
+      15. embedding_model_version          (H-2: model lineage in hash)
+
+    Output is the first 32 hex characters (128 bits) of the digest.
+    Birthday-bound collision probability stays negligible at the stated
+    PROD scale (10⁸ assets × decisions/year). Floats are formatted to
+    4 decimal places to remove platform float-drift sources.
     """
     parts = [
         str(sorted(triggered_rules)),
@@ -372,9 +394,12 @@ def _compute_evaluation_hash(
         str(is_first_offense),
         str(has_prior_disputes),
         str(distinct_matched_owner_count),
+        decision_config_version or "",
+        confidence_config_version or "",
+        embedding_model_version or "",
     ]
     digest = hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
-    return digest[:16]
+    return digest[:32]
 
 
 def _select_primary_reason(
@@ -508,6 +533,7 @@ def evaluate_policy(
             is_first_offense=context.is_first_offense,
             has_prior_disputes=context.has_prior_disputes,
             distinct_matched_owner_count=context.distinct_matched_owner_count,
+            embedding_model_version=context.embedding_model_version,
         )
 
     # =================================================================
@@ -735,6 +761,7 @@ def evaluate_policy(
         is_first_offense=context.is_first_offense,
         has_prior_disputes=context.has_prior_disputes,
         distinct_matched_owner_count=context.distinct_matched_owner_count,
+        embedding_model_version=context.embedding_model_version,
     )
 
 
@@ -763,6 +790,7 @@ def _build_result(
     is_first_offense: bool,
     has_prior_disputes: bool,
     distinct_matched_owner_count: int,
+    embedding_model_version: Optional[str],
 ) -> PolicyResult:
     primary_reason = _select_primary_reason(
         primary_reason_candidates,
@@ -783,6 +811,9 @@ def _build_result(
         is_first_offense=is_first_offense,
         has_prior_disputes=has_prior_disputes,
         distinct_matched_owner_count=distinct_matched_owner_count,
+        decision_config_version=decision_config_version,
+        confidence_config_version=confidence_config_version,
+        embedding_model_version=embedding_model_version,
     )
     return PolicyResult(
         final_action=final_action,
@@ -801,6 +832,7 @@ def _build_result(
         policy_version=POLICY_VERSION,
         decision_config_version=decision_config_version,
         confidence_config_version=confidence_config_version,
+        embedding_model_version=embedding_model_version,
         rules_checked_count=rules_checked_count,
         evaluation_hash=evaluation_hash,
     )

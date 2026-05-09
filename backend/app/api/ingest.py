@@ -1,4 +1,5 @@
 from fastapi import APIRouter
+from rq import Retry
 from app.models.ingest import IngestRequest, IngestResponse
 from app.core.event_store import (
     IngestReceivedPayload,
@@ -11,6 +12,12 @@ import uuid
 
 router = APIRouter(prefix="/v1", tags=["ingest"])
 
+# H-7: bounded retry with backoff. RQ defaults to zero retries; a single
+# transient Redis blip terminally fails the job. Three attempts at
+# 10/60/300s covers fail-overs and brief network partitions; further
+# failures fall through to JOB_FAILED + DLQ (future work).
+_INGEST_RETRY = Retry(max=3, interval=[10, 60, 300])
+
 
 @router.post("/ingest", response_model=IngestResponse)
 def ingest(req: IngestRequest) -> IngestResponse:
@@ -21,6 +28,7 @@ def ingest(req: IngestRequest) -> IngestResponse:
         "app.workers.pipeline_worker.run_pipeline",
         job_id,
         job_timeout=300,
+        retry=_INGEST_RETRY,
     )
 
     # Audit trail starts at the API boundary, after the job is durably

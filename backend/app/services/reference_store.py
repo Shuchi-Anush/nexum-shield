@@ -57,9 +57,12 @@ _SEED_SOURCES = [
 _REGISTRY: List[ProtectedAsset] = [
     ProtectedAsset(
         asset_id=entry["asset_id"],
+        # Store the hex content_hash, not the Fingerprint dataclass.
+        # `embedding_engine.embed` calls `bytes.fromhex(...)` on this value;
+        # passing the dataclass raises TypeError and breaks the matching path.
         fingerprint=fingerprint_engine.compute_fingerprint(
             entry["request"].model_dump(mode="json")
-        ),
+        ).content_hash,
         owner=entry["owner"],
         trust_level=entry["trust_level"],
     )

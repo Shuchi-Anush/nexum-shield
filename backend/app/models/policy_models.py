@@ -70,6 +70,14 @@ class PolicyContext(BaseModel):
     matched_asset_owner: Optional[str] = None
     distinct_matched_owner_count: int = 1
 
+    # ── Lineage context (H-1 / H-2) ──
+    # Carries the upstream embedding model version into the policy
+    # evaluation_hash so that a model upgrade is reflected in the hash
+    # even when the (risk_band, confidence_tier, signals...) tuple is
+    # otherwise unchanged. Optional + default None preserves smoke-test
+    # compatibility for callers that don't supply it.
+    embedding_model_version: Optional[str] = None
+
 
 class ActionTrace(BaseModel):
     """Per-phase mutation chain for the action."""
@@ -103,6 +111,11 @@ class PolicyResult(BaseModel):
     policy_version: str
     decision_config_version: str
     confidence_config_version: str
+
+    # Lineage echo (H-1 / H-2) — upstream model version contributing
+    # to evaluation_hash. Optional for compatibility with callers that
+    # do not provide it.
+    embedding_model_version: Optional[str] = None
 
     # Integrity / completeness
     rules_checked_count: int

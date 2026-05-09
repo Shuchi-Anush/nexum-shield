@@ -41,6 +41,14 @@ from app.core.config import get_settings
 from app.core.queue import redis_conn
 
 
+# M-6: cap WATCH/MULTI/EXEC retry loops so a contention storm cannot
+# spin a request thread forever. Far above any realistic contention
+# (per-job lock serialises worker writes; only the API + worker race
+# on create_job), so genuine traffic never hits this limit. Hitting
+# the cap surfaces as a RuntimeError that bubbles to RQ for retry.
+_MAX_WATCH_RETRIES = 50
+
+
 class JobStatus(str, Enum):
     QUEUED = "queued"
     PROCESSING = "processing"
@@ -143,7 +151,7 @@ class JobStore:
     def create_job(self, job_id: str, metadata: Optional[dict] = None) -> Job:
         key = _key(job_id)
         with redis_conn.pipeline() as pipe:
-            while True:
+            for _ in range(_MAX_WATCH_RETRIES):
                 try:
                     pipe.watch(key)
                     existing = pipe.hgetall(key)
@@ -176,6 +184,9 @@ class JobStore:
                     )
                 except WatchError:
                     continue
+            raise RuntimeError(
+                f"create_job: WATCH retry exhausted for {job_id}"
+            )
 
     def get_job(self, job_id: str) -> Optional[Job]:
         raw = redis_conn.hgetall(_key(job_id))
@@ -186,7 +197,7 @@ class JobStore:
     def update_status(self, job_id: str, status: JobStatus) -> None:
         key = _key(job_id)
         with redis_conn.pipeline() as pipe:
-            while True:
+            for _ in range(_MAX_WATCH_RETRIES):
                 try:
                     pipe.watch(key)
                     current_raw = pipe.hget(key, "status")
@@ -212,11 +223,14 @@ class JobStore:
                     return
                 except WatchError:
                     continue
+            raise RuntimeError(
+                f"update_status: WATCH retry exhausted for {job_id}"
+            )
 
     def update_stage(self, job_id: str, stage: str, output: Any) -> None:
         key = _key(job_id)
         with redis_conn.pipeline() as pipe:
-            while True:
+            for _ in range(_MAX_WATCH_RETRIES):
                 try:
                     pipe.watch(key)
                     raw_stages = pipe.hget(key, "stages")
@@ -229,7 +243,7 @@ class JobStore:
                     pipe.hset(
                         key,
                         mapping={
-                            "stages": json.dumps(stages),
+                            "stages": json.dumps(stages, sort_keys=True),
                             "updated_at": repr(time.time()),
                         },
                     )
@@ -238,6 +252,9 @@ class JobStore:
                     return
                 except WatchError:
                     continue
+            raise RuntimeError(
+                f"update_stage({stage}): WATCH retry exhausted for {job_id}"
+            )
 
     def set_result(self, job_id: str, result: dict) -> None:
         key = _key(job_id)
@@ -257,7 +274,7 @@ class JobStore:
     def set_failure(self, job_id: str, reason: str) -> None:
         key = _key(job_id)
         with redis_conn.pipeline() as pipe:
-            while True:
+            for _ in range(_MAX_WATCH_RETRIES):
                 try:
                     pipe.watch(key)
                     current_raw = pipe.hget(key, "status")
@@ -284,6 +301,9 @@ class JobStore:
                     return
                 except WatchError:
                     continue
+            raise RuntimeError(
+                f"set_failure: WATCH retry exhausted for {job_id}"
+            )
 
 
 # GLOBAL SINGLETON
