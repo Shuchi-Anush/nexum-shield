@@ -178,9 +178,9 @@ def _fingerprint_synth(payload: dict) -> Fingerprint:
     seed_bytes = hashlib.sha256(canonical.encode("utf-8")).digest()
 
     # Deterministic 30-frame sequence (≈30s clip @ 1fps), 64-bit pHashes.
-    # Use BLAKE2 chaining for cheap, deterministic expansion.
-    rng = hashlib.blake2b(seed_bytes, digest_size=8 * 30)
-    raw = rng.digest()
+    # SHAKE-256 because BLAKE2b is capped at 64 bytes per call and we need
+    # 240 deterministic bytes (30 × 8) — XOFs are the right primitive.
+    raw = hashlib.shake_256(seed_bytes).digest(8 * 30)
     phashes: List[int] = [
         struct.unpack(">Q", raw[i : i + 8])[0] for i in range(0, len(raw), 8)
     ]

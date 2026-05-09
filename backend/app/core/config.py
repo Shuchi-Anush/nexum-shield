@@ -107,6 +107,11 @@ class Settings(BaseSettings):
     class Config:
         env_file = BASE_DIR / ".env"
         case_sensitive = True
+        # Tolerate keys present in .env but not declared above (e.g.
+        # legacy VECTOR_DIM, SIMILARITY_THRESHOLD, LOG_LEVEL). Pydantic v2
+        # forbids extras by default, which would otherwise crash every
+        # process that imports `app.core.queue` at startup.
+        extra = "ignore"
 
 
 @lru_cache
