@@ -62,6 +62,20 @@ class PipelineEventType(str, Enum):
 
     These are the named transitions a downstream consumer can subscribe
     to. They sit alongside lifecycle audit events in the same store.
+
+    Canonical taxonomy after engine-triple wiring (per
+    docs/specs/eventing.md §13.4 + docs/specs/job_processing.md §5.3):
+
+      RISK_SCORED            - DecisionEngine output (EVALUATION phase)
+      CONFIDENCE_COMPUTED    - ConfidenceEngine output (EVALUATION phase)
+      POLICY_DECIDED         - PolicyEngine output (DECISION phase)
+
+    Backward-compatible legacy events retained during transition:
+
+      SCORED      - emitted alongside RISK_SCORED, band derived from
+                    RiskScore.band; will be retired post-rollout.
+      ENFORCED    - extended payload still emitted; carries the legacy
+                    3-action form (ALLOW/FLAG/BLOCK) for old consumers.
     """
 
     INGEST_RECEIVED = "INGEST_RECEIVED"
@@ -69,8 +83,14 @@ class PipelineEventType(str, Enum):
     EMBEDDING_READY = "EMBEDDING_READY"
     MATCH_FOUND = "MATCH_FOUND"
     MATCH_NOT_FOUND = "MATCH_NOT_FOUND"
+    # Canonical engine-triple events
+    RISK_SCORED = "RISK_SCORED"
+    CONFIDENCE_COMPUTED = "CONFIDENCE_COMPUTED"
+    POLICY_DECIDED = "POLICY_DECIDED"
+    # Legacy bridge events (retained for compatibility during transition)
     SCORED = "SCORED"
     ENFORCED = "ENFORCED"
+    # Terminal
     JOB_COMPLETED = "JOB_COMPLETED"
     JOB_FAILED = "JOB_FAILED"
 
@@ -110,21 +130,77 @@ class MatchNotFoundPayload(BaseModel):
 
 
 class ScoredPayload(BaseModel):
+    """Legacy bridge event — band derived from RiskScore.band post-migration."""
+
     band: str
     similarity: float
 
 
 class EnforcedPayload(BaseModel):
-    action: str
+    """Enforcement record. Extended post-migration with policy_action +
+    evaluation_hash + policy_version for audit lineage; ``action`` keeps
+    the legacy 3-action vocabulary (ALLOW/FLAG/BLOCK) for old consumers."""
+
+    action: str                            # legacy 3-action: ALLOW | FLAG | BLOCK
     similarity: float
     band: str
     model_version: str
     matched_media_id: Optional[str] = None
+    # Canonical extensions (additive — old consumers ignore unknown fields)
+    policy_action: Optional[str] = None    # 5-action: ALLOW|FLAG|REVIEW|RESTRICT|TAKEDOWN
+    evaluation_hash: Optional[str] = None
+    policy_version: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# Canonical engine-triple payloads (per docs/specs/eventing.md §13.4)
+# ---------------------------------------------------------------------------
+
+
+class RiskScoredPayload(BaseModel):
+    """DecisionEngine output snapshot — risk dimension of EVALUATION."""
+
+    composite: float
+    band: str                              # RiskBand.value
+    decision_config_version: str
+    # Per-term raw + weighted contributions for full audit (per
+    # docs/specs/decision_engine.md §5.5).
+    breakdown: Dict[str, Dict[str, float]]
+
+
+class ConfidenceComputedPayload(BaseModel):
+    """ConfidenceEngine output snapshot — certainty dimension of EVALUATION."""
+
+    composite: float
+    tier: str                              # ConfidenceTier.value
+    agreement: float
+    completeness: float
+    uncertainty: float
+    triggered_conditions: List[str]
+    confidence_config_version: str
+
+
+class PolicyDecidedPayload(BaseModel):
+    """PolicyEngine output snapshot — DECISION phase result. Carries the
+    full A4 lineage (engine versions + evaluation_hash + triggered rules)
+    so downstream audit projection is event-complete without rereading the
+    job hash."""
+
+    action: str                            # PolicyAction.value (5-level)
+    triggered_rules: List[str]
+    primary_reason: str
+    evaluation_hash: str
+    policy_version: str
+    decision_config_version: str
+    confidence_config_version: str
+    risk_band: str
+    confidence_tier: str
+    rules_checked_count: int
 
 
 class JobCompletedPayload(BaseModel):
     terminal_status: str          # "completed" | "flagged"
-    action: str
+    action: str                   # legacy 3-action for backward-compat
 
 
 class JobFailedPayload(BaseModel):
@@ -139,6 +215,9 @@ _PAYLOAD_SCHEMA: Dict[PipelineEventType, Type[BaseModel]] = {
     PipelineEventType.EMBEDDING_READY: EmbeddingReadyPayload,
     PipelineEventType.MATCH_FOUND: MatchFoundPayload,
     PipelineEventType.MATCH_NOT_FOUND: MatchNotFoundPayload,
+    PipelineEventType.RISK_SCORED: RiskScoredPayload,
+    PipelineEventType.CONFIDENCE_COMPUTED: ConfidenceComputedPayload,
+    PipelineEventType.POLICY_DECIDED: PolicyDecidedPayload,
     PipelineEventType.SCORED: ScoredPayload,
     PipelineEventType.ENFORCED: EnforcedPayload,
     PipelineEventType.JOB_COMPLETED: JobCompletedPayload,
@@ -152,7 +231,10 @@ _STAGE_FOR: Dict[PipelineEventType, str] = {
     PipelineEventType.EMBEDDING_READY: "embedding",
     PipelineEventType.MATCH_FOUND: "matching",
     PipelineEventType.MATCH_NOT_FOUND: "matching",
-    PipelineEventType.SCORED: "scoring",
+    PipelineEventType.RISK_SCORED: "evaluation",
+    PipelineEventType.CONFIDENCE_COMPUTED: "evaluation",
+    PipelineEventType.POLICY_DECIDED: "decision",
+    PipelineEventType.SCORED: "scoring",          # legacy bridge stage label
     PipelineEventType.ENFORCED: "enforcement",
     PipelineEventType.JOB_COMPLETED: "job",
     PipelineEventType.JOB_FAILED: "job",

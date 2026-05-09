@@ -13,6 +13,34 @@ TTL expired. Any exception during pipeline execution flips the job to
 FAILED before the lock is released, so jobs are never stranded in
 PROCESSING by a clean exception path.
 
+Engine-triple wiring (post-runtime-convergence)
+-----------------------------------------------
+
+EVALUATION phase invokes ``decision_engine.compute_risk`` and
+``confidence_engine.compute_confidence`` in sequence within a single
+``evaluation`` stage. The DECISION phase invokes
+``policy_engine.evaluate_policy`` over the assembled DecisionOutput +
+ConfidenceBreakdown + PolicyContext (per docs/specs/job_processing.md
+§5.2). The five-level ``PolicyAction`` is mapped to the legacy
+3-action ``ALLOW/FLAG/BLOCK`` vocabulary for backward-compatible
+``ENFORCED`` payloads and to the terminal ``JobStatus`` per
+docs/specs/job_processing.md §3.3 / §5.5.
+
+Backward compatibility during transition
+----------------------------------------
+
+The worker still emits ``SCORED`` (with band derived from the new
+``RiskScore.band``) and ``ENFORCED`` (with the legacy ``action`` field
+plus additive ``policy_action`` / ``evaluation_hash`` / ``policy_version``
+fields) so existing consumers continue to work. The canonical
+``RISK_SCORED`` / ``CONFIDENCE_COMPUTED`` / ``POLICY_DECIDED`` events
+are emitted alongside.
+
+Legacy ``scoring_engine`` and ``enforcement_engine`` are no longer
+invoked by the worker; the modules remain in the repository as
+deprecated transition-window code (per docs/specs/job_processing.md
+§5.5 phase C).
+
 At each stage transition the worker publishes a canonical pipeline event
 (`.claude/rules/eventing.md`) via `publish_event`, alongside the lifecycle
 audit emitted by the `stage_event` context manager. Domain events carry
@@ -23,10 +51,12 @@ single sorted-set scan.
 
 from __future__ import annotations
 
+import time
 import uuid
-from typing import Any, Optional
+from typing import Any, Dict, List, Optional
 
 from app.core.event_store import (
+    ConfidenceComputedPayload,
     EmbeddingReadyPayload,
     EnforcedPayload,
     FingerprintReadyPayload,
@@ -35,6 +65,8 @@ from app.core.event_store import (
     MatchFoundPayload,
     MatchNotFoundPayload,
     PipelineEventType,
+    PolicyDecidedPayload,
+    RiskScoredPayload,
     ScoredPayload,
     publish_event,
     stage_event,
@@ -42,13 +74,53 @@ from app.core.event_store import (
 from app.core.job_store import JobStatus, job_store
 from app.core.queue import redis_conn
 from app.engines import (
+    confidence_engine,
+    decision_engine,
     embedding_engine,
-    enforcement_engine,
     fingerprint_engine,
     matching_engine,
-    scoring_engine,
+    policy_engine,
 )
+from app.models.confidence_models import (
+    ConfidenceConfig,
+    ConfidenceInput,
+    TrustState,
+)
+from app.models.decision_models import (
+    DecisionInput,
+    DecisionOutput,
+    InputSnapshot,
+    MatchInputSnapshot,
+    MatchSignal,
+    RiskScore,
+    ScoreSignal,
+    ThresholdConfig,
+    TrustSignal,
+)
+from app.models.policy_models import PolicyAction, PolicyContext, PolicyResult
 
+
+# ---------------------------------------------------------------------------
+# Configuration (engine triple)
+# ---------------------------------------------------------------------------
+
+# Module-level config singletons. ThresholdConfig and ConfidenceConfig both
+# validate their weights at construction time (per
+# docs/specs/decision_engine.md §4.2 and docs/specs/confidence_engine.md §4.2)
+# so any drift surfaces at import, not at request time.
+_THRESHOLD_CONFIG = ThresholdConfig()
+_CONFIDENCE_CONFIG = ConfidenceConfig()
+
+# Version strings carried into engine_lineage. Bumped in lockstep with the
+# canonical specs (per docs/specs/decision_engine.md §16 and
+# docs/specs/confidence_engine.md §16).
+_DECISION_CONFIG_VERSION = "v1.0"
+_CONFIDENCE_CONFIG_VERSION = "v3"
+
+
+# ---------------------------------------------------------------------------
+# Lock semantics (per docs/specs/job_processing.md §8)
+# ---------------------------------------------------------------------------
 
 _LOCK_TTL_SECONDS = 300
 
@@ -88,6 +160,261 @@ def _release_lock(job_id: str, token: str) -> None:
         pass
 
 
+# ---------------------------------------------------------------------------
+# Action mapping (5-action PolicyAction → legacy 3-action / terminal status)
+# ---------------------------------------------------------------------------
+
+# Maps the 5-action canonical PolicyAction (per
+# docs/specs/policy_engine.md §2.1) to the legacy 3-action vocabulary
+# carried in the ENFORCED event's ``action`` field for backward-compatible
+# consumers. REVIEW collapses to FLAG (human review = soft flag). RESTRICT
+# and TAKEDOWN both collapse to BLOCK (automated enforcement applied).
+_POLICY_ACTION_TO_LEGACY: Dict[PolicyAction, str] = {
+    PolicyAction.ALLOW: "ALLOW",
+    PolicyAction.FLAG: "FLAG",
+    PolicyAction.REVIEW: "FLAG",
+    PolicyAction.RESTRICT: "BLOCK",
+    PolicyAction.TAKEDOWN: "BLOCK",
+}
+
+# Maps PolicyAction to the terminal JobStatus per
+# docs/specs/job_processing.md §3.3: FLAGGED reserved for actions
+# requiring human follow-up (FLAG, REVIEW); COMPLETED for fully-resolved
+# actions (ALLOW + automated enforcement).
+_POLICY_ACTION_TO_TERMINAL: Dict[PolicyAction, JobStatus] = {
+    PolicyAction.ALLOW: JobStatus.COMPLETED,
+    PolicyAction.FLAG: JobStatus.FLAGGED,
+    PolicyAction.REVIEW: JobStatus.FLAGGED,
+    PolicyAction.RESTRICT: JobStatus.COMPLETED,
+    PolicyAction.TAKEDOWN: JobStatus.COMPLETED,
+}
+
+
+# ---------------------------------------------------------------------------
+# Trust + signal source mapping
+# ---------------------------------------------------------------------------
+
+# Maps the matching engine's ``trust_level`` strings to numeric trust
+# scores consumed by the DecisionEngine. Conservative mapping: unknown
+# defaults near zero so missing-registry signals don't inflate risk.
+_TRUST_LEVEL_TO_SCORE: Dict[str, float] = {
+    "verified": 0.95,
+    "premium": 0.75,
+    "basic": 0.50,
+    "unknown": 0.20,
+}
+
+# Vocabulary divergence between engines is documented in
+# docs/specs/decision_engine.md §3.5 / D-DE-3 — DecisionEngine's quality
+# table uses ``"fingerprint+embedding"`` while ConfidenceEngine and
+# PolicyEngine use ``"fusion"``. The current matching pipeline produces
+# both fingerprint (via pHash) and embedding (cosine) signals, so we emit
+# the fusion-equivalent value to each consumer in the form it expects.
+_DECISION_SIGNAL_SOURCE = "fingerprint+embedding"
+_CONFIDENCE_SIGNAL_SOURCE = "fusion"
+_POLICY_SIGNAL_SOURCE = "fusion"
+
+
+def _trust_score(trust_level: Optional[str]) -> float:
+    if trust_level is None:
+        return _TRUST_LEVEL_TO_SCORE["unknown"]
+    return _TRUST_LEVEL_TO_SCORE.get(trust_level, _TRUST_LEVEL_TO_SCORE["unknown"])
+
+
+def _trust_signal(trust_level: Optional[str]) -> TrustSignal:
+    return TrustSignal(trust_score=_trust_score(trust_level))
+
+
+def _trust_state(trust_level: Optional[str]) -> TrustState:
+    """Map a trust-registry tier to the ConfidenceEngine's TrustState.
+
+    A missing or 'unknown' tier sets ``is_default=True`` so the
+    ConfidenceEngine treats the trust signal as registry-default (per
+    docs/specs/confidence_engine.md §4.3); the trust_score field is
+    consulted only when ``is_default == False``.
+    """
+    if trust_level is None or trust_level == "unknown":
+        return TrustState(trust_score=0.0, is_default=True)
+    return TrustState(
+        trust_score=_TRUST_LEVEL_TO_SCORE.get(trust_level, 0.0),
+        is_default=False,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Engine input assembly
+# ---------------------------------------------------------------------------
+
+
+def _build_decision_input(
+    *,
+    similarity: float,
+    matched_asset: Optional[Dict[str, Any]],
+    uploader_trust_level: Optional[str],
+) -> DecisionInput:
+    """Assemble the DecisionEngine input from upstream stage outputs.
+
+    Trust signals are derived from ``matched_asset.trust_level`` (owner)
+    and the request's uploader trust hint (today defaulting to 'basic';
+    the trust-reader spec is planned per
+    docs/specs/decision_engine.md D-DE-4). Observation count + timestamps
+    default to zero today — the observation store integration is a
+    future expansion.
+    """
+    owner_trust_level = (
+        matched_asset.get("trust_level") if matched_asset else None
+    )
+    return DecisionInput(
+        match=MatchSignal(similarity=similarity),
+        trust_owner=_trust_signal(owner_trust_level),
+        trust_uploader=_trust_signal(uploader_trust_level),
+        score=ScoreSignal(signal_source=_DECISION_SIGNAL_SOURCE),
+        observation_count=0,
+        config_version=_DECISION_CONFIG_VERSION,
+        observation_timestamps=(),
+    )
+
+
+def _build_confidence_input(
+    *,
+    match_found: bool,
+    similarity: float,
+    matched_asset: Optional[Dict[str, Any]],
+    uploader_trust_level: Optional[str],
+) -> ConfidenceInput:
+    """Assemble the ConfidenceEngine input.
+
+    Trust states use ``TrustState(is_default=...)`` semantics so the
+    confidence engine derives S2/S3 (signal presence) and U2/U3
+    (uncertainty) correctly. observation_count defaults to zero today.
+    """
+    owner_trust_level = (
+        matched_asset.get("trust_level") if matched_asset else None
+    )
+    return ConfidenceInput(
+        match_found=match_found,
+        similarity=similarity,
+        trust_owner=_trust_state(owner_trust_level),
+        trust_uploader=_trust_state(uploader_trust_level),
+        observation_count=0,
+        signal_source=_CONFIDENCE_SIGNAL_SOURCE,
+        config_version=_CONFIDENCE_CONFIG_VERSION,
+    )
+
+
+def _build_decision_output(
+    *,
+    risk: RiskScore,
+    match_found: bool,
+    similarity: float,
+) -> DecisionOutput:
+    """Wrap RiskScore into the DecisionOutput envelope consumed by
+    PolicyEngine.
+
+    Per docs/specs/confidence_engine.md §10.1 / C-CE-9, the
+    ``input_snapshot.config_version`` carries the **confidence** config
+    version (NOT the decision config version) — this is the canonical
+    quirk PolicyEngine relies on at
+    docs/specs/policy_engine.md §4.1.
+    """
+    return DecisionOutput(
+        risk=risk,
+        input_snapshot=InputSnapshot(
+            match=MatchInputSnapshot(matched=match_found, similarity=similarity),
+            config_version=_CONFIDENCE_CONFIG_VERSION,
+        ),
+    )
+
+
+def _build_policy_context(
+    *,
+    content_type: str,
+    matched_asset: Optional[Dict[str, Any]],
+    uploader_trust_level: Optional[str],
+) -> PolicyContext:
+    """Assemble the PolicyContext.
+
+    Operational fields default conservatively (first_offense=True;
+    has_prior_disputes=False; no recent violations) — these will be
+    sourced from a future operator/observation store integration. The
+    defaults are biased toward leniency so PolicyEngine's R2 first-
+    offense downgrade fires; production rollout SHOULD wire these to
+    durable state before relying on the ladder for automated
+    enforcement.
+    """
+    owner_trust_level = (
+        matched_asset.get("trust_level") if matched_asset else None
+    )
+    matched_asset_owner = matched_asset.get("owner") if matched_asset else None
+    return PolicyContext(
+        is_first_offense=True,
+        has_prior_disputes=False,
+        prior_dispute_outcomes=[],
+        content_type=content_type,
+        trust_owner_tier=owner_trust_level or "unknown",
+        trust_uploader_tier=uploader_trust_level or "basic",
+        uploader_is_default=(uploader_trust_level is None),
+        owner_is_default=(matched_asset is None),
+        recent_violations_count=0,
+        signal_source=_POLICY_SIGNAL_SOURCE,
+        has_multiple_matches=False,
+        matched_asset_owner=matched_asset_owner,
+        distinct_matched_owner_count=1,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Output serialisation (for stages dict + payloads)
+# ---------------------------------------------------------------------------
+
+
+def _serialise_breakdown(risk: RiskScore) -> Dict[str, Dict[str, float]]:
+    bd = risk.breakdown
+    return {
+        "similarity": {"raw": bd.similarity.raw, "weighted": bd.similarity.weighted},
+        "trust_owner": {"raw": bd.trust_owner.raw, "weighted": bd.trust_owner.weighted},
+        "trust_uploader": {
+            "raw": bd.trust_uploader.raw,
+            "weighted": bd.trust_uploader.weighted,
+        },
+        "velocity": {"raw": bd.velocity.raw, "weighted": bd.velocity.weighted},
+        "match_quality": {
+            "raw": bd.match_quality.raw,
+            "weighted": bd.match_quality.weighted,
+        },
+    }
+
+
+def _serialise_risk(risk: RiskScore) -> Dict[str, Any]:
+    return {
+        "composite": risk.composite,
+        "band": risk.band.value,
+        "breakdown": _serialise_breakdown(risk),
+        "decision_config_version": risk.config_version,
+    }
+
+
+def _serialise_confidence(confidence) -> Dict[str, Any]:
+    return {
+        "composite": confidence.composite,
+        "tier": confidence.tier.value,
+        "agreement": confidence.agreement,
+        "completeness": confidence.completeness,
+        "uncertainty": confidence.uncertainty,
+        "triggered_conditions": [r.value for r in confidence.triggered_conditions],
+        "confidence_config_version": _CONFIDENCE_CONFIG_VERSION,
+    }
+
+
+def _serialise_policy_result(result: PolicyResult) -> Dict[str, Any]:
+    return result.model_dump(mode="json")
+
+
+# ---------------------------------------------------------------------------
+# Pipeline body
+# ---------------------------------------------------------------------------
+
+
 def run_pipeline(job_id: str) -> None:
     token = _acquire_lock(job_id)
     if token is None:
@@ -106,6 +433,13 @@ def run_pipeline(job_id: str) -> None:
             job_store.update_status(job_id, JobStatus.PROCESSING)
 
             payload: Any = job.metadata or {}
+            metadata_dict: Dict[str, Any] = (
+                payload if isinstance(payload, dict) else {}
+            )
+            content_type: str = metadata_dict.get("content_type") or "video"
+            uploader_trust_level: Optional[str] = (
+                metadata_dict.get("uploader_trust_level")
+            )
 
             # ------------------------------------------------------------
             # Fingerprint
@@ -173,7 +507,9 @@ def run_pipeline(job_id: str) -> None:
                     },
                 )
 
-            if match.matched_asset is not None:
+            match_found = match.matched_asset is not None
+
+            if match_found:
                 publish_event(
                     job_id,
                     PipelineEventType.MATCH_FOUND,
@@ -192,44 +528,189 @@ def run_pipeline(job_id: str) -> None:
                 )
 
             # ------------------------------------------------------------
-            # Scoring
+            # Evaluation — DecisionEngine + ConfidenceEngine
             # ------------------------------------------------------------
-            with stage_event(job_id, "scoring"):
-                band = scoring_engine.score(match.similarity)
-                job_store.update_stage(job_id, "scoring", {"band": band.value})
+            # Per docs/specs/job_processing.md §5.2, the EVALUATION phase
+            # invokes both engines; their outputs are independent and
+            # MAY be parallelised in the future. The DecisionOutput
+            # envelope assembled here is the canonical input contract
+            # for the DECISION phase below.
+            with stage_event(job_id, "evaluation"):
+                decision_input = _build_decision_input(
+                    similarity=match.similarity,
+                    matched_asset=matched_asset_dict,
+                    uploader_trust_level=uploader_trust_level,
+                )
+                confidence_input = _build_confidence_input(
+                    match_found=match_found,
+                    similarity=match.similarity,
+                    matched_asset=matched_asset_dict,
+                    uploader_trust_level=uploader_trust_level,
+                )
 
+                risk = decision_engine.compute_risk(
+                    decision_input, _THRESHOLD_CONFIG
+                )
+                confidence = confidence_engine.compute_confidence(
+                    confidence_input, _CONFIDENCE_CONFIG
+                )
+
+                decision_output = _build_decision_output(
+                    risk=risk,
+                    match_found=match_found,
+                    similarity=match.similarity,
+                )
+
+                job_store.update_stage(
+                    job_id,
+                    "evaluation",
+                    {
+                        "risk": _serialise_risk(risk),
+                        "confidence": _serialise_confidence(confidence),
+                    },
+                )
+
+            # Canonical engine-triple events
+            publish_event(
+                job_id,
+                PipelineEventType.RISK_SCORED,
+                RiskScoredPayload(
+                    composite=risk.composite,
+                    band=risk.band.value,
+                    decision_config_version=risk.config_version,
+                    breakdown=_serialise_breakdown(risk),
+                ),
+            )
+            publish_event(
+                job_id,
+                PipelineEventType.CONFIDENCE_COMPUTED,
+                ConfidenceComputedPayload(
+                    composite=confidence.composite,
+                    tier=confidence.tier.value,
+                    agreement=confidence.agreement,
+                    completeness=confidence.completeness,
+                    uncertainty=confidence.uncertainty,
+                    triggered_conditions=[
+                        r.value for r in confidence.triggered_conditions
+                    ],
+                    confidence_config_version=_CONFIDENCE_CONFIG_VERSION,
+                ),
+            )
+
+            # Legacy bridge: SCORED event with band derived from RiskScore.
+            # Retained for backward-compatible consumers; will be retired
+            # post-rollout.
             publish_event(
                 job_id,
                 PipelineEventType.SCORED,
-                ScoredPayload(band=band.value, similarity=match.similarity),
+                ScoredPayload(band=risk.band.value, similarity=match.similarity),
             )
 
             # ------------------------------------------------------------
-            # Enforcement
+            # Decision — PolicyEngine
             # ------------------------------------------------------------
-            with stage_event(job_id, "enforcement"):
-                decision = enforcement_engine.decide(
-                    input_media_id=content_hash,
+            with stage_event(job_id, "decision"):
+                policy_context = _build_policy_context(
+                    content_type=content_type,
                     matched_asset=matched_asset_dict,
-                    similarity=match.similarity,
-                    band=band,
-                    model_version=embedding_engine.MODEL_VERSION,
+                    uploader_trust_level=uploader_trust_level,
                 )
-                job_store.update_stage(job_id, "enforcement", decision)
+                policy_result = policy_engine.evaluate_policy(
+                    decision_output, confidence, policy_context
+                )
+                job_store.update_stage(
+                    job_id,
+                    "decision",
+                    _serialise_policy_result(policy_result),
+                )
+
+            publish_event(
+                job_id,
+                PipelineEventType.POLICY_DECIDED,
+                PolicyDecidedPayload(
+                    action=policy_result.final_action.value,
+                    triggered_rules=list(policy_result.triggered_rules),
+                    primary_reason=policy_result.primary_reason,
+                    evaluation_hash=policy_result.evaluation_hash,
+                    policy_version=policy_result.policy_version,
+                    decision_config_version=policy_result.decision_config_version,
+                    confidence_config_version=policy_result.confidence_config_version,
+                    risk_band=policy_result.risk_band.value,
+                    confidence_tier=policy_result.confidence_tier.value,
+                    rules_checked_count=policy_result.rules_checked_count,
+                ),
+            )
+
+            # ------------------------------------------------------------
+            # Enforcement — apply the final action
+            # ------------------------------------------------------------
+            # The PolicyEngine has already selected the canonical action
+            # under PBRA. The enforcement stage today is the boundary at
+            # which the action becomes visible; the actual takedown /
+            # restriction effector lives in the (planned) enforcement-
+            # audit layer (docs/security/enforcement_audit.md). This
+            # stage records the evidence and emits the ENFORCED event.
+            final_action = policy_result.final_action
+            legacy_action = _POLICY_ACTION_TO_LEGACY[final_action]
+
+            with stage_event(job_id, "enforcement"):
+                evidence: Dict[str, Any] = {
+                    "input_media_id": content_hash,
+                    "matched_media_id": (
+                        matched_asset_dict["asset_id"]
+                        if matched_asset_dict
+                        else None
+                    ),
+                    "owner": (
+                        matched_asset_dict["owner"]
+                        if matched_asset_dict
+                        else None
+                    ),
+                    "trust_level": (
+                        matched_asset_dict["trust_level"]
+                        if matched_asset_dict
+                        else None
+                    ),
+                    "similarity_score": match.similarity,
+                    "band": risk.band.value,
+                    "model_version": embedding_engine.MODEL_VERSION,
+                    "timestamp": time.time(),
+                    # Policy lineage (per A4 audit-completeness-with-provenance)
+                    "policy_action": final_action.value,
+                    "policy_legacy_action": legacy_action,
+                    "primary_reason": policy_result.primary_reason,
+                    "triggered_rules": list(policy_result.triggered_rules),
+                    "evaluation_hash": policy_result.evaluation_hash,
+                    "policy_version": policy_result.policy_version,
+                    "decision_config_version": policy_result.decision_config_version,
+                    "confidence_config_version": policy_result.confidence_config_version,
+                }
+                job_store.update_stage(
+                    job_id,
+                    "enforcement",
+                    {
+                        "action": legacy_action,
+                        "policy_action": final_action.value,
+                        "reason": evidence,
+                    },
+                )
 
             publish_event(
                 job_id,
                 PipelineEventType.ENFORCED,
                 EnforcedPayload(
-                    action=decision["action"],
+                    action=legacy_action,
                     similarity=match.similarity,
-                    band=band.value,
+                    band=risk.band.value,
                     model_version=embedding_engine.MODEL_VERSION,
                     matched_media_id=(
                         matched_asset_dict["asset_id"]
                         if matched_asset_dict
                         else None
                     ),
+                    policy_action=final_action.value,
+                    evaluation_hash=policy_result.evaluation_hash,
+                    policy_version=policy_result.policy_version,
                 ),
             )
 
@@ -237,19 +718,20 @@ def run_pipeline(job_id: str) -> None:
             # Terminal transition
             # ------------------------------------------------------------
             result = {
-                "match": match.matched_asset is not None,
-                "owner": match.matched_asset.owner if match.matched_asset else None,
-                "confidence": match.similarity,
-                "action": decision["action"],
-                "reason": decision["reason"],
+                "match": match_found,
+                "owner": (
+                    match.matched_asset.owner if match.matched_asset else None
+                ),
+                "confidence": match.similarity,           # legacy field — echoed for compat
+                "action": legacy_action,                  # legacy 3-action
+                "policy_action": final_action.value,      # canonical 5-action
+                "primary_reason": policy_result.primary_reason,
+                "evaluation_hash": policy_result.evaluation_hash,
+                "reason": evidence,
             }
             job_store.set_result(job_id, result)
 
-            terminal = (
-                JobStatus.FLAGGED
-                if decision["action"] in ("FLAG", "BLOCK")
-                else JobStatus.COMPLETED
-            )
+            terminal = _POLICY_ACTION_TO_TERMINAL[final_action]
             job_store.update_status(job_id, terminal)
 
             publish_event(
@@ -257,7 +739,7 @@ def run_pipeline(job_id: str) -> None:
                 PipelineEventType.JOB_COMPLETED,
                 JobCompletedPayload(
                     terminal_status=terminal.value,
-                    action=decision["action"],
+                    action=legacy_action,
                 ),
             )
 

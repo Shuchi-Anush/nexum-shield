@@ -1,9 +1,25 @@
-"""Enforcement stage.
+"""Enforcement stage — DEPRECATED transitional bridge.
 
-Combines confidence band + matched asset into a structured action plus an
-auditable explanation. Every decision carries the full evidence record
-required by .claude/rules/enforcement.md (input id, matched id, similarity,
-model version, timestamp).
+Combines confidence band + matched asset into a structured 3-action
+decision (ALLOW/FLAG/BLOCK) with an auditable explanation. The canonical
+runtime now performs the DECISION phase via
+``app.engines.policy_engine.evaluate_policy`` over a 5-action
+``PolicyAction`` ladder (ALLOW/FLAG/REVIEW/RESTRICT/TAKEDOWN) per
+docs/specs/policy_engine.md §2.1.
+
+Status:
+    DEPRECATED — pipeline_worker no longer invokes this module. Retained
+    for the transition window per docs/specs/job_processing.md §5.5
+    (Phase C deprecation). The 3-action vocabulary is preserved on the
+    ``ENFORCED`` event's ``action`` field for backward-compatible
+    consumers; the canonical ``policy_action`` field carries the
+    5-level value.
+
+Successor:
+    ``app.engines.policy_engine.evaluate_policy`` performs the full PBRA
+    decision (PROPOSE / BOUND / REFINE / ASSERT) producing a
+    ``PolicyResult`` with deterministic audit lineage
+    (``evaluation_hash``, ``triggered_rules``, version triad).
 """
 
 from __future__ import annotations

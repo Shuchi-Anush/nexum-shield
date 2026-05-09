@@ -91,14 +91,14 @@ from __future__ import annotations
 import hashlib
 import logging
 from dataclasses import dataclass
-from typing import Iterable, Protocol
+from typing import Iterable
 
 from app.models.confidence_models import (
     ConfidenceBreakdown,
     ConfidenceReasonCode,
     ConfidenceTier,
 )
-from app.models.decision_models import RiskBand
+from app.models.decision_models import DecisionOutput, RiskBand
 from app.models.policy_models import (
     ActionTrace,
     EvidenceStrength,
@@ -208,46 +208,12 @@ _logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------
-# Structural typing for the upstream DecisionEngine output
+# Upstream DecisionEngine output is consumed via the concrete
+# DecisionOutput dataclass from app.models.decision_models. Smoke tests
+# (backend/tests/_smoke_policy.py) supply ad-hoc namespace objects that
+# duck-type to the same shape; Python does not enforce types at runtime
+# so the smoke surface continues to work without modification.
 # ---------------------------------------------------------------------
-#
-# v2 spec §1: PolicyContext duplicated DecisionOutput / ConfidenceBreakdown
-# fields. Fix is to read them from the upstream objects directly. Since
-# the full DecisionOutput type is defined in a sibling module not yet
-# committed, we use a Protocol to express the structural contract here.
-
-
-class _MatchAccess(Protocol):
-    matched: bool
-    similarity: float
-
-
-class _InputSnapshotAccess(Protocol):
-    match: _MatchAccess
-    config_version: str
-
-
-class _RiskAccess(Protocol):
-    band: RiskBand
-    composite: float
-    config_version: str
-
-
-class DecisionOutput(Protocol):
-    """Structural contract for the upstream DecisionEngine output.
-
-    Required attributes:
-
-      ``risk.band``                     — :class:`RiskBand`
-      ``risk.composite``                — float (informational)
-      ``risk.config_version``           — str (echoed into PolicyResult)
-      ``input_snapshot.match.matched``  — bool
-      ``input_snapshot.match.similarity`` — float
-      ``input_snapshot.config_version`` — str (echoed into PolicyResult)
-    """
-
-    risk: _RiskAccess
-    input_snapshot: _InputSnapshotAccess
 
 
 # ---------------------------------------------------------------------

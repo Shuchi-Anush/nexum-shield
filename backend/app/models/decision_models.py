@@ -5,6 +5,12 @@ RiskBand enum that classifies the composite score, and the RiskBreakdown
 that exposes both raw and weighted per-term contributions for
 auditability. Lives in the models package so the engine module stays
 purely behavioural.
+
+Also defines the DecisionOutput envelope consumed by the PolicyEngine
+(per docs/specs/decision_engine.md §5.3 + docs/specs/policy_engine.md
+§4.1). The envelope wraps RiskScore plus an InputSnapshot whose
+config_version field carries the *confidence* config version through
+to PolicyEngine — see docs/specs/confidence_engine.md §10.1 / C-CE-9.
 """
 
 from __future__ import annotations
@@ -90,3 +96,50 @@ class RiskScore:
     composite: float
     band: RiskBand
     breakdown: RiskBreakdown
+    config_version: str = ""        # threaded from DecisionInput.config_version
+
+
+# -----------------------------------------------------------------------
+# DecisionOutput envelope — consumed by PolicyEngine
+# -----------------------------------------------------------------------
+#
+# Per docs/specs/decision_engine.md §5.3 and docs/specs/policy_engine.md
+# §4.1, the PolicyEngine consumes a structural envelope wrapping RiskScore
+# plus an InputSnapshot. Materialising this as a concrete dataclass closes
+# decision_engine.md D-DE-1 part 1 and is the runtime convergence point
+# for the engine triple.
+
+
+@dataclass(frozen=True)
+class MatchInputSnapshot:
+    """Match facts captured at the moment risk was computed."""
+
+    matched: bool
+    similarity: float
+
+
+@dataclass(frozen=True)
+class InputSnapshot:
+    """Snapshot of inputs handed to the DECISION phase.
+
+    The ``config_version`` field carries the **confidence** config version
+    through to PolicyEngine (see docs/specs/confidence_engine.md §10.1 /
+    C-CE-9). The pipeline worker is responsible for setting it correctly
+    when assembling the envelope.
+    """
+
+    match: MatchInputSnapshot
+    config_version: str
+
+
+@dataclass(frozen=True)
+class DecisionOutput:
+    """Envelope consumed by PolicyEngine.evaluate_policy.
+
+    Pairs the EVALUATION-phase ``RiskScore`` with the ``InputSnapshot``
+    that produced it. Owned by the decision domain; assembled by the
+    pipeline worker (per docs/specs/job_processing.md §5.4).
+    """
+
+    risk: RiskScore
+    input_snapshot: InputSnapshot

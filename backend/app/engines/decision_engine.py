@@ -89,6 +89,7 @@ def compute_risk(input: DecisionInput, config: ThresholdConfig) -> RiskScore:
         composite=composite,
         band=_band(composite, config),
         breakdown=breakdown,
+        config_version=input.config_version,
     )
 
 
